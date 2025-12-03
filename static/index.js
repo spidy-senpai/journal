@@ -10,15 +10,14 @@ import { getAuth,
 
 
 const firebaseConfig = {
-    apiKey: "AIzaSyAu_fXf_EoNpp10WRs7xc2F3fKbla7WAS0",
-    authDomain: "simple-firebase-91658.firebaseapp.com",
-    projectId: "simple-firebase-91658",
-    storageBucket: "simple-firebase-91658.appspot.com",
-    messagingSenderId: "424748845206",
-    appId: "1:424748845206:web:966c5ed3fc459277411ab7",
-    measurementId: "G-H4WKK504Y4"
-  };
-
+  apiKey: "AIzaSyDXZ_Q3UJKepiwSao4IIo5vBNVx80UJNMo",
+  authDomain: "moon-69bef.firebaseapp.com",
+  projectId: "moon-69bef",
+  storageBucket: "moon-69bef.firebasestorage.app",
+  messagingSenderId: "489523094617",
+  appId: "1:489523094617:web:f641df150b037c7f49bd48",
+  measurementId: "G-3BXWF2S80J"
+};
   // Initialize Firebase
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);

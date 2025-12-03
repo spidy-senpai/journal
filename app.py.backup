@@ -1,0 +1,419 @@
+from flask import Flask, redirect, render_template, request, make_response, session, abort, jsonify, url_for
+import secrets
+from functools import wraps
+from firebase_admin import firestore, auth
+from datetime import timedelta, datetime
+import os
+from dotenv import load_dotenv
+from crud import upload_file_to_cloudinary
+from firebase_config import db
+import base64
+from io import BytesIO
+import google.generativeai as genai
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
+
+load_dotenv()
+
+# Configure Gemini API
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-pro')
+else:
+    print("⚠️ Warning: GEMINI_API_KEY not found in environment variables")
+    model = None
+
+app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY')
+
+# Configure session cookie settings
+app.config['SESSION_COOKIE_SECURE'] = False  # Ensure cookies are sent over HTTPS
+app.config['SESSION_COOKIE_HTTPONLY'] = True  # Prevent JavaScript access to cookies
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=3)  # Adjust session expiration as needed
+app.config['SESSION_REFRESH_EACH_REQUEST'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # Can be 'Strict', 'Lax', or 'None'
+
+# Firebase is already initialized in firebase_config.py
+# Just import db from there (done above)
+
+########################################
+""" Authentication and Authorization """
+
+# Decorator for routes that require authentication
+def auth_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Check if user is authenticated
+        if 'user' not in session:
+            return redirect(url_for('login'))
+        else:
+            return f(*args, **kwargs)
+    return decorated_function
+
+@app.route('/auth', methods=['POST'])
+def authorize():
+    token = request.headers.get('Authorization')
+    if not token or not token.startswith('Bearer '):
+        return "Unauthorized", 401
+
+    token = token[7:]  # Strip off 'Bearer ' to get the actual token
+
+    try:
+        decoded_token = auth.verify_id_token(token, check_revoked=True, clock_skew_seconds=60)
+        session['user'] = decoded_token
+        return redirect(url_for('dashboard'))
+    except:
+        return "Unauthorized", 401
+    else:
+        return render_template('login.html')
+
+@app.route('/signup')
+@app.route('/api/entries/<date_id>', methods=['GET'])
+@auth_required
+def get_entry(date_id):
+    """Retrieve a specific entry by date ID"""
+    try:
+        uid = session['user']['uid']
+        
+        entry_ref = db.collection('artifacts').document('default-journal-app-id').collection('users').document(uid).collection('entries').document(date_id)
+        entry_doc = entry_ref.get()
+        
+        if not entry_doc.exists:
+            return jsonify({'error': 'Entry not found'}), 404
+        
+        entry_data = entry_doc.to_dict()
+        entry_data['date_id'] = date_id
+        
+        return jsonify(entry_data), 200
+    except Exception as e:
+        print(f"Error retrieving entry: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/entries/<date_id>', methods=['DELETE'])
+@auth_required
+def delete_entry(date_id):
+    """Delete a journal entry"""
+    try:
+        uid = session['user']['uid']
+        
+        entry_ref = db.collection('artifacts').document('default-journal-app-id').collection('users').document(uid).collection('entries').document(date_id)
+        entry_ref.delete()
+        
+        return jsonify({'success': True, 'message': 'Entry deleted successfully'}), 200
+    except Exception as e:
+        print(f"Error deleting entry: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+    # ==================== GEMINI API - Virtual Profile Analysis ====================
+
+def analyze_entry_with_gemini(entry_text, uid):
+    """
+    Analyze a diary entry using Gemini API to create/update user virtual profile.
+    Extracts personality traits, emotional patterns, interests, habits, and behavioral insights.
+    """
+    if not model or not GEMINI_API_KEY:
+        print("⚠️ Gemini API not configured. Skipping analysis.")
+        return None
+    
+    try:
+        # Create detailed prompt for user profiling
+        prompt = f"""You are a professional psychologist and behavioral analyst. Analyze the following diary entry carefully and provide a comprehensive user profile based on this single entry.
+
+DIARY ENTRY:
+{entry_text}
+
+Please provide analysis in the following JSON format:
+{{
+    "personality_traits": ["list of identified personality traits"],
+    "emotional_state": "current emotional state and intensity",
+    "interests_hobbies": ["identified interests and hobbies"],
+    "habits_patterns": ["behavioral patterns and habits"],
+    "values_priorities": ["values and what matters to the user"],
+    "challenges_concerns": ["identified challenges or concerns"],
+    "behavioral_insights": "key behavioral observations",
+    "mental_health_indicators": "positive and any concerning mental health indicators",
+    "relationship_insights": "insights about relationships mentioned",
+    "summary": "2-3 sentence summary of the user based on this entry"
+}}
+
+Be specific, insightful, and nuanced. Look for both explicit and implicit information."""
+
+        response = model.generate_content(prompt)
+        
+        # Parse the response
+        import json
+        response_text = response.text
+        
+        # Try to extract JSON from the response
+        try:
+            # Find JSON block in response
+            start_idx = response_text.find('{')
+            end_idx = response_text.rfind('}') + 1
+            if start_idx >= 0 and end_idx > start_idx:
+                json_str = response_text[start_idx:end_idx]
+                analysis_data = json.loads(json_str)
+            else:
+                analysis_data = {"raw_analysis": response_text}
+        except json.JSONDecodeError:
+            analysis_data = {"raw_analysis": response_text}
+        
+        # Add metadata
+        analysis_data['timestamp'] = datetime.utcnow()
+        analysis_data['uid'] = uid
+        
+        return analysis_data
+        
+    except Exception as e:
+        print(f"❌ Error analyzing entry with Gemini: {e}")
+        return None
+
+
+def daily_analysis_job():
+    """
+    Scheduled job that runs daily at 12 AM (UTC).
+    Fetches all users' latest entries and runs Gemini analysis.
+    """
+    print(f"\n🔄 Running daily virtual profile analysis job at {datetime.utcnow()}")
+    
+    try:
+        # Get all users
+        users_ref = db.collection('artifacts').document('default-journal-app-id').collection('users')
+        users = users_ref.stream()
+        
+        analysis_count = 0
+        
+        for user_doc in users:
+            uid = user_doc.id
+            
+            try:
+                # Get the most recent entry (check last 24 hours)
+                entries_ref = users_ref.document(uid).collection('entries')
+                
+                # Get today's entry (most recent)
+                entries_query = entries_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).limit(1)
+                recent_entries = entries_query.stream()
+                
+                entry_to_analyze = None
+                for entry_doc in recent_entries:
+                    entry_data = entry_doc.to_dict()
+                    entry_to_analyze = entry_data
+                    break
+                
+                if not entry_to_analyze or not entry_to_analyze.get('text'):
+                    continue
+                
+                # Analyze the entry
+                analysis = analyze_entry_with_gemini(entry_to_analyze.get('text', ''), uid)
+                
+                if analysis:
+                    # Save to virtual_profile collection
+                    profile_ref = users_ref.document(uid).collection('virtual_profile')
+                    
+                    # Save analysis with timestamp as document ID
+                    timestamp_str = datetime.utcnow().isoformat()
+                    profile_ref.document(timestamp_str).set(analysis)
+                    
+                    analysis_count += 1
+                    print(f"✅ Analyzed entry for user {uid}")
+                    
+            except Exception as e:
+                print(f"⚠️ Error processing user {uid}: {e}")
+                continue
+        
+        print(f"✅ Daily analysis job completed. Analyzed {analysis_count} users.")
+        
+    except Exception as e:
+        print(f"❌ Error in daily_analysis_job: {e}")
+
+
+@app.route('/api/analyze-now', methods=['POST'])
+@auth_required
+def manual_analysis():
+    """Manually trigger analysis for current user's latest entry (for testing)"""
+    if not model or not GEMINI_API_KEY:
+        return jsonify({'error': 'Gemini API not configured'}), 500
+    
+    try:
+        uid = session['user']['uid']
+        
+        # Get the most recent entry
+        entries_ref = db.collection('artifacts').document('default-journal-app-id').collection('users').document(uid).collection('entries')
+        entries_query = entries_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).limit(1)
+        recent_entries = entries_query.stream()
+        
+        entry_to_analyze = None
+        for entry_doc in recent_entries:
+            entry_to_analyze = entry_doc.to_dict()
+            break
+        
+        if not entry_to_analyze or not entry_to_analyze.get('text'):
+            return jsonify({'error': 'No entry found to analyze'}), 404
+        
+        # Analyze the entry
+        analysis = analyze_entry_with_gemini(entry_to_analyze.get('text', ''), uid)
+        
+        if not analysis:
+            return jsonify({'error': 'Failed to analyze entry'}), 500
+        
+        # Save to virtual_profile collection
+        profile_ref = db.collection('artifacts').document('default-journal-app-id').collection('users').document(uid).collection('virtual_profile')
+        timestamp_str = datetime.utcnow().isoformat()
+        profile_ref.document(timestamp_str).set(analysis)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Entry analyzed and profile updated',
+            'analysis': analysis
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in manual analysis: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ==================== FUMIKO AI INTEGRATION ====================
+
+def send_gemini_prompt(prompt_text, model="gemini-2.5-flash"):
+    """Send prompt to Gemini API and get response"""
+    if not GEMINI_API_KEY:
+        return "Gemini API not configured"
+    
+    try:
+        model_obj = genai.GenerativeModel(model)
+        response = model_obj.generate_content(prompt_text)
+        return response.text
+    except Exception as e:
+        print(f"Error sending prompt to Gemini: {e}")
+        return f"Error: {str(e)}"
+
+
+def get_past_7_days_entries(uid):
+    """Fetch the past 7 days of diary entries for a user"""
+    try:
+        entries_ref = db.collection('artifacts').document('default-journal-app-id').collection('users').document(uid).collection('entries')
+        
+        # Get entries from the last 7 days
+        seven_days_ago = datetime.utcnow() - timedelta(days=7)
+        
+        entries_query = entries_ref.where('timestamp', '>=', seven_days_ago).order_by('timestamp', direction=firestore.Query.DESCENDING)
+        entries = entries_query.stream()
+        
+        past_entries = []
+        for entry_doc in entries:
+            entry_data = entry_doc.to_dict()
+            entry_data['date_id'] = entry_doc.id
+            past_entries.append(entry_data)
+        
+        return past_entries
+        
+    except Exception as e:
+        print(f"Error fetching past entries: {e}")
+        return []
+
+
+def get_user_virtual_profile(uid):
+    """Fetch the most recent virtual profile for a user"""
+    try:
+        profile_ref = db.collection('artifacts').document('default-journal-app-id').collection('users').document(uid).collection('virtual_profile')
+        
+        # Get the most recent profile
+        profiles = profile_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).limit(1).stream()
+        
+        for profile_doc in profiles:
+            return profile_doc.to_dict()
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error fetching virtual profile: {e}")
+        return None
+
+
+def get_current_entry(uid):
+    """Fetch the current/latest diary entry for a user"""
+    try:
+        entries_ref = db.collection('artifacts').document('default-journal-app-id').collection('users').document(uid).collection('entries')
+        virtual_profile = get_user_virtual_profile(uid)
+        chat_history = get_chat_history(uid, limit=10)
+        
+        return jsonify({
+            'success': True,
+            'current_entry': current_entry[:200] if current_entry else 'No current entry',
+            'past_entries_count': len(past_entries),
+            'past_entries': [
+                {
+                    'date': entry.get('date_id', 'Unknown'),
+                    'preview': entry.get('text', 'No text')[:150]
+                }
+                for entry in past_entries
+            ],
+            'virtual_profile': {
+                'personality_traits': virtual_profile.get('personality_traits', []) if virtual_profile else [],
+                'emotional_state': virtual_profile.get('emotional_state', 'Not available') if virtual_profile else 'Not available',
+                'interests': virtual_profile.get('interests_hobbies', []) if virtual_profile else [],
+                'has_profile': bool(virtual_profile)
+            },
+            'chat_history_count': len(chat_history)
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in fumiko_context: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/fumiko-history', methods=['GET'])
+@auth_required
+def get_fumiko_history():
+    """Get all chat history with Fumiko"""
+    try:
+        uid = session['user']['uid']
+        limit = request.args.get('limit', 50, type=int)
+        
+        chat_history = get_chat_history(uid, limit=limit)
+        
+        return jsonify({
+            'success': True,
+            'messages': chat_history
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in get_fumiko_history: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ==================== SCHEDULER SETUP ====================
+
+scheduler = BackgroundScheduler()
+
+# Schedule the analysis job to run every day at 12:00 AM UTC
+scheduler.add_job(
+    func=daily_analysis_job,
+    trigger="cron",
+    hour=0,
+    minute=0,
+    id='daily_analysis_job',
+    name='Daily Virtual Profile Analysis',
+    replace_existing=True
+)
+
+def start_scheduler():
+    """Start the background scheduler"""
+    if not scheduler.running:
+        scheduler.start()
+        print("✅ Scheduler started - Daily analysis scheduled for 12:00 AM UTC")
+
+def stop_scheduler():
+    """Stop the background scheduler"""
+    if scheduler.running:
+        scheduler.shutdown()
+        print("✅ Scheduler stopped")
+
+# Register shutdown handler
+atexit.register(stop_scheduler)
+
+
+if __name__ == '__main__':
+    start_scheduler()
+    app.run(debug=True)

@@ -166,7 +166,7 @@ function authCreateAccountWithEmail() {
             } else if (errorCode === "auth/weak-password") {
                 errorMsgPassword.textContent = "Invalid password - must be at least 6 characters"
             } else if (errorCode === "auth/email-already-in-use") {
-                errorMsgEmail.textContent = "An account already exists for this email."
+                errorMsgEmail.textContent = "User already exists."
             }
 
         });
