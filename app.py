@@ -32,6 +32,16 @@ app.secret_key = os.getenv('SECRET_KEY')
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
 app.config['MAX_FORM_MEMORY_SIZE'] = 100 * 1024 * 1024  # 100MB max form data
 
+# CORS support for web tunnels
+from flask_cors import CORS
+CORS(app, resources={
+    r"/api/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
+
 # Configure session cookie settings
 app.config['SESSION_COOKIE_SECURE'] = False # Ensure cookies are sent over HTTPS
 app.config['SESSION_COOKIE_HTTPONLY'] = True  # Prevent JavaScript access to cookies
@@ -229,38 +239,99 @@ def chat_krishna():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/fumiko', methods=['POST'])
+@app.route('/api/fumiko', methods=['POST', 'OPTIONS'])
 @auth_required
 def fumiko_chat():
     """Handle chat messages for Fumiko model"""
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        return '', 204
+    
     try:
         uid = session['user']['uid']
+        print(f"\n🤖 Fumiko Chat Request")
+        print(f"  User ID: {uid}")
+        
         data = request.get_json()
-        user_message = data.get('message', '')
+        user_message = data.get('message', '').strip()
         provided_context = data.get('context', '')
         chat_id = data.get('chat_id', 'default')
         
-        # Fetch context data
-        past_entries_list = get_past_7_days_entries(uid)
-        virtual_profile = get_user_virtual_profile(uid)
-        chat_history = get_chat_history(uid, limit=5, model_name='fumiko')
+        if not user_message:
+            return jsonify({'error': 'Message cannot be empty'}), 400
         
-        a=chat_system(provided_context,past_entries_list,chat_history,virtual_profile)
-        fumiko_response =a.chat_fumiko(user_message)
-        if len(user_message) <= 10 :
-            time.sleep(4)
-        else:
+        print(f"  Message: {user_message[:50]}...")
+        print(f"  Chat ID: {chat_id}")
+        
+        # Fetch context data
+        print(f"  📚 Fetching context data...")
+        try:
+            past_entries_list = get_past_7_days_entries(uid)
+            print(f"    ✓ Past entries: {len(past_entries_list)}")
+        except Exception as e:
+            print(f"    ⚠️ Error fetching past entries: {e}")
+            past_entries_list = []
+        
+        try:
+            virtual_profile = get_user_virtual_profile(uid)
+            print(f"    ✓ Virtual profile: {'Found' if virtual_profile else 'Not found'}")
+        except Exception as e:
+            print(f"    ⚠️ Error fetching virtual profile: {e}")
+            virtual_profile = None
+        
+        try:
+            chat_history = get_chat_history(uid, limit=5, model_name='fumiko')
+            print(f"    ✓ Chat history: {len(chat_history)} messages")
+        except Exception as e:
+            print(f"    ⚠️ Error fetching chat history: {e}")
+            chat_history = []
+        
+        # Call Fumiko AI
+        print(f"  🤖 Calling Fumiko AI...")
+        try:
+            a = chat_system(provided_context, past_entries_list, chat_history, virtual_profile)
+            fumiko_response = a.chat_fumiko(user_message)
+            print(f"    ✓ Response generated: {len(fumiko_response)} chars")
+        except Exception as ai_error:
+            print(f"    ❌ AI Error: {ai_error}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({'error': f'AI service error: {str(ai_error)}'}), 503
+        
+        # Add delay for better UX
+        if len(user_message) <= 10:
             time.sleep(2)
-        # Save the chat to history with Fumiko model name
-        save_chat_history(uid, chat_id, user_message, 'user', fumiko_response, model_name='fumiko')
+        else:
+            time.sleep(1)
+        
+        # Save chat history
+        print(f"  💾 Saving to database...")
+        try:
+            save_success = save_chat_history(uid, chat_id, user_message, 'user', fumiko_response, model_name='fumiko')
+            if save_success:
+                print(f"    ✓ Chat saved successfully")
+            else:
+                print(f"    ⚠️ Chat save returned False")
+        except Exception as save_error:
+            print(f"    ⚠️ Error saving chat: {save_error}")
+            # Don't fail the response, still send the AI response
+        
+        print(f"  ✅ Request completed successfully\n")
         
         return jsonify({
             'response': fumiko_response,
-            'model': 'fumiko'
-        })
+            'model': 'fumiko',
+            'success': True
+        }), 200
+        
     except Exception as e:
-        print(f"Error in fumiko_chat: {e}")
-        return jsonify({'error': str(e)}), 500
+        print(f"  ❌ Error in fumiko_chat: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'error': str(e),
+            'details': 'Check server logs for more information'
+        }), 500
 
 
 #########################################################

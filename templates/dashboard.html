@@ -3453,20 +3453,34 @@
             try {
                 // Route to the appropriate model endpoint
                 const endpoint = currentModel === 'fumiko' ? '/api/fumiko' : '/api/krishna';
+                
+                console.log(`🤖 Sending message to ${endpoint}...`);
                 const response = await fetch(endpoint, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ message, context })
                 });
+                
+                console.log(`Response status: ${response.status}`);
                 const data = await response.json();
+                
+                if (!response.ok) {
+                    console.error('❌ API Error:', data);
+                    const errorMsg = data.error || 'Connection error';
+                    addMessage(`❌ Error: ${errorMsg}`, 'ai');
+                    return;
+                }
+                
                 if (data.response) {
+                    console.log(`✅ AI Response received: ${data.response.substring(0, 50)}...`);
                     addMessage(data.response, 'ai');
                 } else {
-                    addMessage("Sorry, I encountered an error.", 'ai');
+                    console.error('No response data:', data);
+                    addMessage("Sorry, I encountered an error. Please try again.", 'ai');
                 }
             } catch (error) {
-                console.error('Chat error:', error);
-                addMessage("Error connecting to AI.", 'ai');
+                console.error('❌ Chat error:', error);
+                addMessage(`⚠️ Connection error: ${error.message}. Check your internet connection.`, 'ai');
             }
         }
 
